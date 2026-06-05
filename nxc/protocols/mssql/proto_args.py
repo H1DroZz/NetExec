@@ -19,6 +19,7 @@ def proto_args(parser, parents):
 
     cgroup = mssql_parser.add_argument_group("Command Execution")
     cgroup.add_argument("--no-output", action="store_true", help="do not retrieve command output")
+    cgroup.add_argument("--exec-method", choices=["xp_cmdshell", "agent_job", "ole_automation"], default="xp_cmdshell", help="method to execute the command (default: xp_cmdshell)")
     xgroup = cgroup.add_mutually_exclusive_group()
     xgroup.add_argument("-x", metavar="COMMAND", dest="execute", help="execute the specified command")
     xgroup.add_argument("-X", metavar="PS_COMMAND", dest="ps_execute", help="execute the specified PowerShell command")

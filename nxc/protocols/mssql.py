@@ -320,9 +320,20 @@ class mssql(connection):
         self.logger.debug(f"{get_output=}")
 
         output = ""
+        exec_method_name = getattr(self.args, "exec_method", "xp_cmdshell")
+        exec_method_labels = {
+            "xp_cmdshell": "xp_cmdshell",
+            "agent_job": "agent job",
+            "ole_automation": "OLE automation",
+        }
         try:
-            exec_method = MSSQLEXEC(self.conn, self.logger)
-            output = exec_method.execute(payload)
+            mssqlexec = MSSQLEXEC(self.conn, self.logger)
+            if exec_method_name == "agent_job":
+                output = mssqlexec.execute_agent_job(payload)
+            elif exec_method_name == "ole_automation":
+                output = mssqlexec.execute_ole(payload)
+            else:
+                output = mssqlexec.execute(payload)
             self.logger.debug(f"Output: {output}")
         except Exception as e:
             self.logger.fail(f"Execute command failed, error: {e!s}")
@@ -331,7 +342,7 @@ class mssql(connection):
             if self.conn.lastError:
                 self.logger.fail(f"Error during command execution: {self.conn.lastError}")
             else:
-                self.logger.success("Executed command via mssqlexec")
+                self.logger.success(f"Executed command via {exec_method_labels[exec_method_name]}")
                 for line in output.splitlines():
                     self.logger.highlight(line.strip())
         return output
